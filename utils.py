@@ -7,10 +7,24 @@ import os
 import sys
 import time
 import math
+import logging
+import numpy as np
 
 import torch.nn as nn
 import torch.nn.init as init
 
+
+def create_logger(name, log_file, level=logging.INFO):
+	l = logging.getLogger(name)
+	formatter = logging.Formatter('[%(asctime)s][%(filename)15s][line:%(lineno)4d][%(levelname)8s] %(message)s')
+	fh = logging.FileHandler(log_file)
+	fh.setFormatter(formatter)
+	sh = logging.StreamHandler()
+	sh.setFormatter(formatter)
+	l.setLevel(level)
+	l.addHandler(fh)
+	l.addHandler(sh)
+	return l
 
 def get_mean_and_std(dataset):
     '''Compute the mean and std value of dataset.'''
@@ -42,12 +56,6 @@ def init_params(net):
                 init.constant(m.bias, 0)
 
 
-_, term_width = os.popen('stty size', 'r').read().split()
-term_width = int(term_width)
-
-TOTAL_BAR_LENGTH = 65.
-last_time = time.time()
-begin_time = last_time
 def progress_bar(current, total, msg=None):
     global last_time, begin_time
     if current == 0:
@@ -122,3 +130,72 @@ def format_time(seconds):
     if f == '':
         f = '0ms'
     return f
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, length=0):
+        self.length = length
+        self.reset()
+
+    def reset(self):
+        if self.length > 0:
+            self.history = []
+        else:
+            self.count = 0
+            self.sum = 0.0
+        self.val = 0.0
+        self.avg = 0.0
+
+    def update(self, val, num=1):
+        if self.length > 0:
+            # currently assert num==1 to avoid bad usage, refine when there are some explict requirements
+            assert num == 1
+            self.history.append(val)
+            if len(self.history) > self.length:
+                del self.history[0]
+
+            self.val = self.history[-1]
+            self.avg = np.mean(self.history)
+        else:
+            self.val = val
+            self.sum += val*num
+            self.count += num
+            self.avg = self.sum / self.count
+
+def adjust_learning_rate(optimizer,epoch, args):
+    """LR schedule that should yield 76% converged accuracy with batch size 256"""
+    local_steps = np.copy(args.lr_steps)
+    local_steps = np.insert(local_steps, 0, 0)
+    local_steps = np.append(local_steps, args.max_epoch)
+    for i in range(len(local_steps)-1): 
+        if epoch >= local_steps[i] and epoch < local_steps[i+1]:
+            factor = i
+            break
+
+    lr = args.lr*(0.1**factor)
+
+
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+def to_python_float(t):
+    if hasattr(t, 'item'):
+        return t.item()
+    else:
+        return t[0]

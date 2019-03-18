@@ -9,23 +9,33 @@ import torch.backends.cudnn as cudnn
 
 import torchvision
 import torchvision.transforms as transforms
+from tensorboardX import SummaryWriter
 
 import os
 import argparse
+import logging
+import time
+import shutil
 
 from models import *
-from utils import progress_bar
+from utils import create_logger, adjust_learning_rate, AverageMeter, accuracy, to_python_float
 
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
 parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
+parser.add_argument('--ckpt', default='experiment/resnet18', type=str)
+parser.add_argument('--max_epoch', default=350, type=int)
+parser.add_argument('--lr_steps', nargs='+', type=int)
+parser.add_argument('--print_freq', default=20, type=int)
+
 args = parser.parse_args()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 
+print(args)
 # Data
 print('==> Preparing data..')
 transform_train = transforms.Compose([
@@ -40,18 +50,28 @@ transform_test = transforms.Compose([
     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
 ])
 
-trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=False, transform=transform_train)
 trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
 
-testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=False, transform=transform_test)
 testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
 
 classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
+# mkdir
+if not os.path.exists(os.path.join(args.ckpt, 'checkpoints')):
+    os.makedirs(os.path.join(args.ckpt, 'checkpoints'))
+if not os.path.exists(os.path.join(args.ckpt, 'logs')):
+    os.makedirs(os.path.join(args.ckpt, 'logs'))
+
+# logger
+logger = create_logger('global_logger', '{}/logs/{}.txt'.format(args.ckpt, time.time()))
+
+
 # Model
 print('==> Building model..')
 # net = VGG('VGG19')
-# net = ResNet18()
+net = ResNet18()
 # net = PreActResNet18()
 # net = GoogLeNet()
 # net = DenseNet121()
@@ -61,7 +81,7 @@ print('==> Building model..')
 # net = DPN92()
 # net = ShuffleNetG2()
 # net = SENet18()
-net = ShuffleNetV2(1)
+# net = ShuffleNetV2(1)
 net = net.to(device)
 if device == 'cuda':
     net = torch.nn.DataParallel(net)
@@ -79,13 +99,18 @@ if args.resume:
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
 
+
 # Training
 def train(epoch):
+    freq = args.print_freq
+    losses = AverageMeter(freq)
+    top1 = AverageMeter(freq)
+    top5 = AverageMeter(freq)
+
     print('\nEpoch: %d' % epoch)
     net.train()
-    train_loss = 0
-    correct = 0
-    total = 0
+    lr = adjust_learning_rate(optimizer, epoch, args)
+
     for batch_idx, (inputs, targets) in enumerate(trainloader):
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
@@ -93,50 +118,77 @@ def train(epoch):
         loss = criterion(outputs, targets)
         loss.backward()
         optimizer.step()
+         
+        prec1, prec5 = accuracy(outputs.data, targets, topk=(1,5))
 
-        train_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
+        losses.update(to_python_float(loss))
+        top1.update(to_python_float(prec1))
+        top5.update(to_python_float(prec5))   
 
-        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-            % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        if batch_idx % args.print_freq == 0 and batch_idx > 1:
+             logger = logging.getLogger('global_logger')
+
+             logger.info('Epoch: [{0}][{1}/{2}]\t'
+                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                       'Prec@5 {top5.val:.3f} ({top5.avg:.3f})\t'
+                       'LR {lr:.3f}'.format(
+                        epoch, batch_idx, len(trainloader),
+                        loss=losses, top1=top1, top5=top5, lr=lr))
+             niter = epoch*len(trainloader)+batch_idx
+
 
 def test(epoch):
     global best_acc
     net.eval()
-    test_loss = 0
-    correct = 0
-    total = 0
+
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(testloader):
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = net(inputs)
             loss = criterion(outputs, targets)
 
-            test_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+            prec1, prec5 = accuracy(outputs.data, targets, topk=(1,5))
+            losses.update(to_python_float(loss), inputs.size(0))
+            top1.update(to_python_float(prec1), inputs.size(0))
+            top5.update(to_python_float(prec5), inputs.size(0))   
 
-            progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
+            
+            if batch_idx % args.print_freq == 0 and batch_idx > 1:
+                logger = logging.getLogger('global_logger')
+
+                logger.info('Epoch: [{0}][{1}/{2}]\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})\t'
+                       .format(epoch, batch_idx, len(trainloader),
+                       loss=losses, top1=top1, top5=top5))
+
+                niter = epoch*len(trainloader)+batch_idx
+
+        logger.info(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
+        .format(top1=top1, top5=top5))
 
     # Save checkpoint.
-    acc = 100.*correct/total
-    if acc > best_acc:
-        print('Saving..')
-        state = {
+    acc = top1.avg
+    print('Saving..')
+    state = {
             'net': net.state_dict(),
             'acc': acc,
             'epoch': epoch,
-        }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/ckpt.t7')
+    }
+    filename =  os.path.join(args.ckpt, 'checkpoints', 'checkpoint.pth.tar')
+    bestfile =  os.path.join(args.ckpt, 'checkpoints', 'model_best.pth.tar')
+    torch.save(state,filename)
+    if acc > best_acc:
         best_acc = acc
+        shutil.copyfile(filename,bestfile)
 
 
-for epoch in range(start_epoch, start_epoch+200):
+for epoch in range(start_epoch, args.max_epoch):
     train(epoch)
     test(epoch)
